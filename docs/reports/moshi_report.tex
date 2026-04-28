@@ -1,0 +1,374 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+% IEEEtran v1.8b 2015/08/26
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{algorithm}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{url}
+\usepackage{array}
+\usepackage{hyperref}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{Replacing Moshi's Helium-7B Backbone with Qwen2.5-0.5B and Low-Rank Adaptation on a Single 15.6\,GB GPU: An Engineering Feasibility Study and Diagnostic Analysis}
+
+\author{
+\IEEEauthorblockN{Author One}
+\IEEEauthorblockA{ID: XXXXX \\
+Department of Computer Science \\
+University Name \\
+Email: xxxxx@xxxxx.edu}
+\and
+\IEEEauthorblockN{Author Two}
+\IEEEauthorblockA{ID: XXXXX \\
+Department of Computer Science \\
+University Name \\
+Email: xxxxx@xxxxx.edu}
+\and
+\IEEEauthorblockN{Author Three}
+\IEEEauthorblockA{ID: XXXXX \\
+Department of Computer Science \\
+University Name \\
+Email: xxxxx@xxxxx.edu}
+}
+
+\maketitle
+
+\begin{abstract}
+Moshi is a recent full-duplex speech-to-speech foundation model whose default text backbone, Helium-7B, dominates its memory footprint and effectively rules out fine-tuning on commodity hardware. In this work we investigate whether Helium-7B can be replaced inside the otherwise frozen Moshi pipeline (Mimi audio codec, depth decoder, generation harness) by a much smaller alternative large language model (LLM), specifically Qwen2.5-0.5B, adapted with Low-Rank Adaptation (LoRA) and 4-bit NF4 quantization, so that the entire system fits on a single free-tier 15.6\,GB Tesla T4 GPU. We design a \texttt{HybridBackbone} interface with bidirectional dimension projectors that allows architecturally heterogeneous LLMs to occupy Moshi's decoder slot without modifying the parent class, and build a complete training and evaluation harness on the DailyTalkContiguous corpus. We report that the architecture loads and runs forward passes successfully under a peak VRAM of approximately 3\,GB, but that the validation loss \emph{diverges} during 1{,}000 training steps (from $7.59$ at step~200 to $9.56$ at step~700), and that the audio-codebook accuracy stays at exactly $0.0$ throughout training; end-to-end speech-to-speech generation produces noise rather than speech. We diagnose three structural causes: (i) an unmasked padding-token loss; (ii) a randomly initialized input projector that scrambles the parent class's pre-summed text-plus-audio embedding; and (iii) a frozen depth decoder receiving out-of-distribution hidden states. We argue this constitutes a defensible negative result and outline the additional measures (knowledge distillation, larger student, unfrozen depth decoder) that future work should adopt to make backbone replacement in tightly-coupled multimodal models tractable.
+\end{abstract}
+
+\begin{IEEEkeywords}
+speech-to-speech models, large language models, low-rank adaptation, quantization, knowledge distillation, Moshi, multimodal foundation models
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+Real-time spoken dialogue with machines is a long-standing goal of speech and language research. Until recently, conversational pipelines decomposed the problem into a cascade of automatic speech recognition (ASR), a text-only LLM, and a text-to-speech (TTS) module. Such cascades suffer from compounding latency, loss of paralinguistic cues, and an inability to model overlap and back-channels. The recent \emph{Moshi} system released by Kyutai \cite{moshi2024} addresses these limitations end-to-end: it jointly models user and assistant audio streams as discrete tokens produced by a learned neural codec (\emph{Mimi}), and predicts both text and audio tokens with a single 7-billion-parameter Transformer (\emph{Helium-7B}) operating at $12.5$\,Hz frame rate, augmented with a small autoregressive \emph{depth decoder} that emits eight residual audio codebooks per frame.
+
+Moshi's quality is impressive, but its 7-billion-parameter backbone places it firmly in the regime of well-funded research labs. Even loaded in 4-bit precision, Helium-7B occupies roughly 5\,GB of GPU memory before any activations, gradients, or optimizer state are allocated. Researchers and students with access only to free-tier cloud GPUs --- typically a Tesla T4 with $15.6$\,GB of VRAM \cite{colab2023} --- cannot fine-tune the model, and even running inference at full precision is impossible. This raises a natural question: \emph{does Helium-7B's specific scale and capability matter to Moshi, or could a much smaller LLM be substituted in its place, recovering most of the system's behaviour at a fraction of the resource cost?}
+
+In this paper we present an engineering feasibility study of one concrete instance of this question: replacing Helium-7B with the 0.5-billion-parameter Qwen2.5-0.5B model \cite{qwen25} adapted via LoRA \cite{lora2021} and 4-bit NF4 quantization \cite{qlora2023}, on a single Tesla T4. Our design preserves Mimi, the depth decoder, and the parent generation harness exactly as released, and inserts a hybrid backbone module into Moshi's decoder slot. The hybrid backbone wraps the smaller LLM with two trainable linear projectors that bridge the dimension mismatch between Qwen's 896-dimensional hidden states and Moshi's expected 4096-dimensional representations. Only the projectors and a low-rank adapter inside Qwen are trained; everything else is frozen.
+
+We make four contributions:
+
+\begin{enumerate}
+    \item We \textbf{demonstrate the engineering feasibility} of loading the full Moshi pipeline plus an alternative LLM backbone in 4-bit precision on a 15.6\,GB GPU, with peak training VRAM of approximately $3$\,GB and a complete resumable training loop using 8-bit AdamW \cite{bitsandbytes2022} and gradient checkpointing.
+    \item We \textbf{identify and patch} two latent bugs in the Moshi reference implementation that block T4 deployment: an integer-overflow in the Mimi convolutional padding logic, and a dtype-propagation inconsistency in the depth decoder's input pathway.
+    \item We \textbf{report a negative training result}: under our setup, validation loss diverges over 700 training steps and audio-codebook accuracy never exceeds $0.0$. End-to-end speech-to-speech generation produces unintelligible noise.
+    \item We provide a \textbf{detailed diagnostic analysis} pinpointing three structural causes for the divergence and propose concrete mitigations for future work, framing the result not as a refutation of backbone replacement in general but as evidence that the naive ``LoRA-only'' recipe successful for standalone causal LMs does not transfer to tightly-coupled multimodal foundation models.
+\end{enumerate}
+
+The rest of the paper is organized as follows. Section~\ref{sec:related} reviews related work on speech-to-speech models, parameter-efficient fine-tuning, and knowledge distillation. Section~\ref{sec:arch} presents the hybrid backbone architecture and training procedure. Section~\ref{sec:setup} describes the experimental setup. Section~\ref{sec:results} reports our results, including the divergent loss curve. Section~\ref{sec:discussion} provides the diagnostic analysis. Section~\ref{sec:limit} discusses limitations and future work, and Section~\ref{sec:conclusion} concludes.
+
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Real-Time Speech-to-Speech Models}
+
+The dominant paradigm for spoken interaction has historically been the ASR\,$\to$\,LLM\,$\to$\,TTS cascade. Recent end-to-end systems such as AudioLM \cite{audiolm2023}, SpeechGPT \cite{speechgpt2023}, and Moshi \cite{moshi2024} have shown that a single Transformer can model both text and discrete audio tokens directly. Moshi extends this line of work by introducing a streaming audio codec (Mimi) at $12.5$\,Hz, modeling user and assistant streams jointly, and using a lightweight depth decoder for the residual codebooks --- enabling theoretical end-to-end latency under $200$\,ms.
+
+\subsection{Parameter-Efficient Fine-Tuning}
+
+LoRA \cite{lora2021} adapts large pre-trained models by injecting rank-$r$ updates into selected linear layers, leaving the original weights frozen. QLoRA \cite{qlora2023} extends this by quantizing the frozen base model to 4-bit NF4 precision while keeping the trainable adapters in higher precision, dramatically reducing memory at minimal accuracy cost. These techniques have become standard for fine-tuning standalone causal LMs on consumer hardware. Their applicability to \emph{multimodal} foundation models with tightly-coupled non-LLM components, however, has received less systematic study, and is the question this paper engages with.
+
+\subsection{Knowledge Distillation for Speech Models}
+
+Hinton et al. \cite{kd2015} introduced knowledge distillation as a way to compress a large ``teacher'' model into a smaller ``student'' by training the student to match the teacher's output distribution. In the speech domain, distillation has been used to compress Whisper \cite{whisper2023}, wav2vec~2.0, and other foundation models. We will return to distillation in Section~\ref{sec:limit} as the principal mitigation our setup omitted.
+
+\subsection{Quantized Inference of Foundation Models}
+
+The \texttt{bitsandbytes} library \cite{bitsandbytes2022} provides 4-bit and 8-bit quantization primitives that are now widely integrated into the Hugging Face Transformers library \cite{transformers2020}. We rely on these primitives to fit both the host Moshi model and a candidate alternative LLM into a single T4.
+
+\section{System Architecture}
+\label{sec:arch}
+
+\subsection{Background: Moshi's Decoder Interface}
+
+The Moshi parent class, \texttt{MoshiForConditionalGeneration}, expects its decoder to be a causal language model with hidden size $d_{\text{old}} = 4096$, vocabulary size $|\mathcal{V}| = 32{,}000$, and a depth decoder that reads the decoder's last hidden state and produces $K = 8$ residual audio codebooks per frame. Crucially, before calling the decoder, the parent class \emph{itself} sums the text-token embedding with $K$ user-audio-codebook embeddings and $K$ assistant-audio-codebook embeddings, all of dimension $d_{\text{old}}$, and passes the result as \texttt{inputs\_embeds}. The decoder therefore receives a $d_{\text{old}}$-dimensional combined embedding, not a token-id sequence, during training.
+
+\subsection{The HybridBackbone Module}
+
+Replacing Helium-7B with a model of different hidden dimension $d_{\text{new}}$ requires bridging this dimension mismatch in both directions. We define \texttt{HybridBackbone} as the composition
+\begin{equation}
+\label{eq:hybrid}
+y = W_{\text{out}}\,\big[\text{LLM}_{\text{LoRA}}\big(W_{\text{in}}\,x\big)\big],
+\end{equation}
+where $x \in \mathbb{R}^{d_{\text{old}}}$ is the parent-supplied combined embedding, $W_{\text{in}} \in \mathbb{R}^{d_{\text{new}} \times d_{\text{old}}}$ projects down to the small LLM's hidden size, $\text{LLM}_{\text{LoRA}}$ is the alternative LLM augmented with rank-$r$ LoRA updates, and $W_{\text{out}} \in \mathbb{R}^{d_{\text{old}} \times d_{\text{new}}}$ projects back up. We initialize both projectors with Xavier-uniform initialization, and reuse Moshi's original $32{,}000$-vocabulary language-model head $\textit{lm\_head}: \mathbb{R}^{d_{\text{old}}} \rightarrow \mathbb{R}^{|\mathcal{V}|}$ frozen. With $d_{\text{old}}=4096$ and $d_{\text{new}}=896$ (Qwen2.5-0.5B), each projector contains approximately $3.7$\,M parameters.
+
+Algorithm~\ref{alg:hybrid} summarizes the forward pass. Critically, the original 4096-dimensional text embedding (\texttt{pre\_embed}) is preserved as a frozen module so that any code path requiring \texttt{input\_ids} rather than \texttt{inputs\_embeds} can still function; in practice, however, the parent class passes \texttt{inputs\_embeds} during training and inference, so this preservation never takes effect on the hot path --- a fact whose implications we examine in Section~\ref{sec:discussion}.
+
+\begin{algorithm}[t]
+\caption{HybridBackbone forward pass}
+\label{alg:hybrid}
+\begin{algorithmic}[1]
+\REQUIRE \texttt{input\_ids} \textbf{or} \texttt{inputs\_embeds}, optional \texttt{labels}
+\IF{\texttt{inputs\_embeds} is None}
+    \STATE $x \leftarrow \texttt{pre\_embed}(\texttt{input\_ids})$ \COMMENT{$d_{\text{old}}$}
+\ELSE
+    \STATE $x \leftarrow \texttt{inputs\_embeds}$
+\ENDIF
+\STATE $h \leftarrow W_{\text{in}}\,x$ \COMMENT{$d_{\text{new}}$}
+\STATE $h \leftarrow \text{LLM}_{\text{LoRA}}(h)$
+\STATE $\hat{h} \leftarrow W_{\text{out}}\,h$ \COMMENT{back to $d_{\text{old}}$}
+\STATE $\text{logits} \leftarrow \texttt{lm\_head}(\hat{h})$
+\IF{\texttt{labels} is not None}
+    \STATE $\mathcal{L} \leftarrow \text{CrossEntropy}(\text{logits}_{:,:-1}, \text{labels}_{:,1:})$
+\ENDIF
+\STATE \textbf{return} $(\hat{h}, \text{logits}, \mathcal{L})$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Memory-Efficient Training Configuration}
+
+To fit the 4-bit-quantized Moshi pipeline, the 4-bit-quantized Qwen2.5-0.5B, the LoRA adapters, the projectors, an 8-bit Adam optimizer state, gradient checkpoints, and a Whisper-tiny ASR model into 15.6\,GB of VRAM simultaneously, we apply the following measures:
+
+\begin{itemize}
+    \item Both Moshi and Qwen are loaded with \texttt{BitsAndBytesConfig} using NF4 4-bit quantization and double-quantization, with the audio encoder (Mimi) and depth decoder explicitly excluded from quantization.
+    \item Mimi parameters are cast to \texttt{bfloat16} after loading (saving roughly $140$\,MB versus \texttt{float32}).
+    \item Gradient checkpointing is enabled on both Qwen and the depth decoder.
+    \item The optimizer is \texttt{bitsandbytes.optim.AdamW8bit}, which reduces optimizer state memory by approximately $4\times$ relative to full-precision AdamW \cite{adamw}.
+    \item Audio sequence length at training time is capped at $2$\,seconds (corresponding to $25$ frames at $12.5$\,Hz) per example.
+\end{itemize}
+
+These measures together hold peak training VRAM at approximately $2.98$\,GB.
+
+\subsection{Trainable Parameter Budget}
+
+Out of approximately $1.35$\,billion total parameters across the assembled hybrid model (4-bit Moshi $\approx$ 7.7\,B nominally but counted compressed, plus Qwen at 500\,M, plus projectors), only the following are unfrozen:
+
+\begin{itemize}
+    \item LoRA adapters in Qwen ($r=16$, $\alpha=32$), targeting \texttt{q\_proj}, \texttt{k\_proj}, \texttt{v\_proj}, \texttt{o\_proj}, \texttt{gate\_proj}, \texttt{up\_proj}, \texttt{down\_proj}: 8.80\,M parameters.
+    \item Input projector $W_{\text{in}}$: 3.67\,M parameters.
+    \item Output projector $W_{\text{out}}$ ($\texttt{HiddenProjector}$): 3.67\,M parameters.
+\end{itemize}
+The total trainable footprint is approximately $150$\,M parameters when counting Qwen's resized token embedding (which is also unfrozen by \texttt{prepare\_model\_for\_kbit\_training}), or $11.16\%$ of the full parameter count.
+
+\section{Experimental Setup}
+\label{sec:setup}
+
+\subsection{Dataset}
+
+We use \texttt{kyutai/DailyTalkContiguous} \cite{dailytalk2023}, a publicly released two-channel dialogue dataset with $24$\,kHz audio and aligned transcripts. From the $2{,}541$ available dialogues we select $200$ at random, splitting them $90/10$ into $180$ training and $20$ validation files. Each dialogue is converted into a stereo wave with channel~0 representing the user turn and channel~1 representing the Moshi-side turn, plus a sidecar transcript file. At training time we crop each example to two seconds; at evaluation time we use up to five seconds.
+
+\subsection{Hyperparameters}
+
+Table~\ref{tab:hyperparams} lists the full training configuration. We choose a moderate LoRA rank, a learning rate of $2 \times 10^{-4}$ with linear warmup over $50$ steps and cosine decay over the full $1{,}000$-step horizon, gradient accumulation of $4$ at micro-batch size $1$ (yielding an effective batch size of $4$), and gradient clipping at norm $1.0$. We checkpoint every $50$ steps and run a full validation pass every $100$ steps.
+
+\begin{table}[t]
+\caption{Training and Evaluation Hyperparameters}
+\label{tab:hyperparams}
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Hardware & Tesla T4, 15.6\,GB VRAM \\
+Moshi repository & \texttt{kmhf/hf-moshiko} \\
+Alternative LLM & \texttt{Qwen/Qwen2.5-0.5B} \\
+Quantization & 4-bit NF4, double-quant \\
+LoRA rank / $\alpha$ / dropout & 16 / 32 / 0.05 \\
+Optimizer & AdamW8bit \\
+Learning rate & $2 \times 10^{-4}$ \\
+LR schedule & linear warmup (50) + cosine \\
+Weight decay & 0.01 \\
+Total steps & 1{,}000 \\
+Micro-batch size & 1 \\
+Gradient accumulation & 4 \\
+Effective batch size & 4 \\
+Grad clipping (max norm) & 1.0 \\
+Train audio length & 2\,s \\
+Eval audio length & 5\,s \\
+Save / eval interval & 50 / 100 steps \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Evaluation Metrics}
+
+We evaluate on two tiers. \emph{Tier-1 text metrics} computed at every $100$ steps include validation cross-entropy loss, perplexity, token-level accuracy, macro F1, and corpus BLEU \cite{bleu2002}. \emph{Tier-2 speech metrics} use Whisper-tiny \cite{whisper2023} to transcribe both the model's generated audio and the reference Moshi-side audio, then compute Word Error Rate (WER) and Character Error Rate (CER) using \texttt{jiwer}; we additionally report \emph{audio token accuracy}, the fraction of generated codebook-0 tokens matching the reference, and the duration ratio of generated to reference audio.
+
+\section{Results}
+\label{sec:results}
+
+\subsection{Engineering Outcomes}
+
+We confirm that the assembled hybrid pipeline loads successfully on a Tesla T4 within the available $15.6$\,GB of VRAM, with a peak training-time allocation of approximately $2.98$\,GB observed via \texttt{torch.cuda.memory\_allocated()}. The resumable checkpoint mechanism survives Colab session restarts: a training run interrupted by a runtime disconnect resumed correctly from step~700 to step~900 with no manual state reconstruction.
+
+In the course of integration we identified two latent issues in the reference implementation that prevent the pipeline from running on T4 without modification:
+
+\begin{itemize}
+    \item \textbf{Mimi padding integer overflow.} The \texttt{MimiConv1d.\_pad1d} static method receives padding arguments as zero-dimensional tensors in some code paths, and on certain T4 driver / CUDA version combinations the resulting padding values are interpreted as $9{,}223{,}372{,}036{,}854{,}703{,}807$ (a 64-bit signed integer near-overflow), causing subsequent convolutions to throw \texttt{RuntimeError: input size 72000, plus negative padding 6 and 9223372036854703807 resulted in...}. We patch this by coercing padding tuples to native Python integers before delegation.
+    \item \textbf{Depth-decoder dtype mismatch.} The depth decoder is loaded in \texttt{float16} when the rest of the decoder is in \texttt{bfloat16}, leading to \texttt{expected mat1 and mat2 to have the same dtype} errors at the depth-decoder input projection. We resolve this by detecting the depth decoder's dtype at patch time and casting the hybrid backbone's last hidden state accordingly.
+\end{itemize}
+
+These patches are reusable contributions independent of the negative training result we report next.
+
+\subsection{Training Dynamics}
+
+Table~\ref{tab:metrics} reports the validation Tier-1 metrics at every evaluation checkpoint during training. The key observation is that \emph{validation loss diverges} between step~200 and step~700, climbing from $7.59$ to $9.56$ (perplexity from approximately $2{,}000$ to $14{,}000$), with token-level accuracy remaining at sub-percent levels throughout. The apparent recovery at step~900 (loss $7.72$) coincides with a Colab runtime restart that reset the optimizer's first- and second-moment estimates; the curve is best interpreted as having restarted divergence from a fresh state at that point.
+
+\begin{table}[t]
+\caption{Validation Metrics History During Training}
+\label{tab:metrics}
+\centering
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{rrrrrr}
+\toprule
+\textbf{Step} & \textbf{Loss} & \textbf{Perplexity} & \textbf{Acc.} & \textbf{F1} & \textbf{BLEU} \\
+\midrule
+200  & 7.59 & 1{,}972  & 0.0104 & 0.0017 & 0.52 \\
+300  & 8.30 & 4{,}015  & 0.0042 & 0.0010 & 0.52 \\
+400  & 8.72 & 6{,}136  & 0.0031 & 0.0007 & 0.45 \\
+500  & 8.76 & 6{,}354  & 0.0010 & 0.0004 & 0.46 \\
+600  & 9.31 & 11{,}013 & 0.0031 & 0.0031 & 0.46 \\
+700  & 9.56 & 14{,}189 & 0.0042 & 0.0029 & 0.44 \\
+900$^\dagger$  & 7.72 & 2{,}257 & 0.0031 & 0.0008 & 0.57 \\
+1000 & 7.79 & 2{,}423  & 0.0031 & 0.0008 & 0.58 \\
+1000$^\ddagger$ & 7.97 & 2{,}900 & 0.0073 & 0.0015 & 0.60 \\
+\bottomrule
+\multicolumn{6}{l}{\footnotesize $^\dagger$ After Colab session restart at step~700.} \\
+\multicolumn{6}{l}{\footnotesize $^\ddagger$ Post-training re-evaluation in a separate session.}
+\end{tabular}
+\end{table}
+
+\subsection{Tier-2 Speech Metrics}
+
+The Tier-2 metrics could not be computed because every validation sample raised \texttt{ValueError: No Moshi audio inputs have been passed alongside the other inputs} when invoking \texttt{model.generate()}. The audio-codebook accuracy, computed independently of the generation harness on the codebook-0 channel, was \emph{exactly $0.0$} at every checkpoint, indicating that the depth decoder's predicted audio tokens bear no correspondence to the reference at any point during training.
+
+\subsection{End-to-End Speech-to-Speech Test}
+
+A custom frame-by-frame decode loop bypassing \texttt{model.generate()} successfully produces a $4.96$-second waveform from a $3$-second user prompt. Manual listening confirms that the output is \emph{noise} --- there is no intelligible speech, and Whisper-tiny transcription returns either silence or hallucinated unrelated tokens. This is consistent with the audio token accuracy of $0.0$.
+
+\subsection{Summary}
+
+The engineering harness works; the trained model does not. Training drives validation loss \emph{up}, not down, and the assistant-side audio output is unrelated to either the input or the reference at the level of discrete tokens or perceived speech. The next section diagnoses why.
+
+\section{Discussion: Root-Cause Analysis}
+\label{sec:discussion}
+
+We identify three structural causes for the divergence, ranked by our assessment of their impact.
+
+\subsection{Unmasked Padding Loss}
+
+Following standard practice, our dataset tokenizes each transcript with \texttt{padding='max\_length'}, \texttt{max\_length=64}, and the pad token assigned to the tokenizer's existing \texttt{<unk>} (id $0$, since Moshi's tokenizer ships with no native pad token). The resulting label tensor contains the pad-token id at every position past the true transcript end --- typically positions $20$ through $63$ for the short DailyTalk turns. Our loss computation
+\begin{equation}
+\mathcal{L} = \text{CrossEntropy}\!\left(\text{logits}_{:,:-1},\, \text{labels}_{:,1:}\right)
+\end{equation}
+omits the standard \texttt{ignore\_index} argument, causing the model to be optimized to predict id $0$ at all padded positions. This creates an objective in tension with itself: position-wise the model is asked to predict actual tokens for the first $\sim$30\% of slots and id $0$ for the remaining $\sim$70\%, and because the projectors and LoRA adapters are randomly initialized, the gradients required to satisfy both objectives have very different scales. The result is that the optimizer is unable to settle into a coherent direction, and validation loss climbs as the projector weights drift further from any useful manifold. Setting \texttt{ignore\_index=tokenizer.pad\_token\_id} would eliminate this failure mode.
+
+\subsection{The Pre-Sum Embedding is Scrambled by a Random Projector}
+
+The architectural rationale we initially set out for our hybrid backbone --- ``preserve the frozen $4096$-dimensional text embedding so the parent class's text-plus-audio summation continues to be meaningful'' --- is, on closer inspection, defeated by the actual code path the parent class takes. \texttt{MoshiForConditionalGeneration} performs the text-plus-audio embedding summation \emph{before} delegating to its decoder, and passes the summed result via the \texttt{inputs\_embeds} argument. Our hybrid backbone's forward pass then applies $W_{\text{in}}$, the input projector, to this summed $4096$-dimensional tensor. Because $W_{\text{in}}$ is initialized at random with Xavier-uniform, the carefully-constructed parent embedding is mapped to a near-isotropic random direction in Qwen's $896$-dimensional input space. The frozen \texttt{pre\_embed} module that motivated the design is reached only when the decoder is called with bare \texttt{input\_ids}, which the parent class never does in either training or inference.
+
+The consequence is that Qwen receives, at every step of training, a randomly-projected version of the input. LoRA adapters of rank $16$ inside Qwen do not have the capacity to undo this scrambling and simultaneously learn the alignment between Qwen's natural representations and the depth decoder's expectations downstream.
+
+\subsection{Frozen Depth Decoder Receives Out-of-Distribution Hidden States}
+
+Moshi's depth decoder is small (much smaller than the backbone) and was trained jointly with Helium-7B to read its specific output hidden-state distribution. We freeze it for VRAM reasons. The output of our backbone, however, is $W_{\text{out}}\big[\text{Qwen}_{\text{LoRA}}(W_{\text{in}}\,x)\big]$ --- a representation in a manifold that the depth decoder has never been exposed to. Because $W_{\text{out}}$ is randomly initialized and only $\sim$3.7\,M parameters wide, no gradient signal flowing back from text-token cross-entropy alone can teach it to produce hidden states that the depth decoder will accept. This is the fundamental reason that audio token accuracy is exactly $0.0$ throughout training and that the final waveform is noise: the depth decoder is doing the only thing it can, which is to confabulate codebook tokens from random conditioning vectors.
+
+\subsection{Secondary Factors}
+
+Beyond the three structural causes above, several secondary factors contribute. The training corpus of $180$ dialogues (approximately a few minutes of audio) is microscopic relative to the $7$ million-hour-class corpus on which Moshi was originally trained. The $1{,}000$-step horizon, even at higher data scale, would be insufficient to align two random projectors with a frozen audio decoder. The capacity gap between Helium-7B and Qwen-0.5B is $14\times$, and even a successful adaptation should be expected to lose substantial behavioural fidelity. Finally, our use of teacher-forcing on text-token cross-entropy alone provides a very sparse signal compared to a representation-matching distillation objective.
+
+\section{Limitations and Recommendations}
+\label{sec:limit}
+
+The negative result we report should be read as bounded: it shows that the specific recipe of ``random-init linear projectors plus low-rank-only adaptation against a teacher-forcing text-token loss'' fails to align a small alternative LLM with the rest of the Moshi pipeline within $1{,}000$ training steps on $180$ dialogues. It does \emph{not} show that backbone replacement in Moshi is impossible. We recommend the following measures for future work:
+
+\begin{enumerate}
+    \item \textbf{Add a hidden-state distillation loss.} Run the original Moshi forward on the same input and supervise $W_{\text{out}}\big[\text{Qwen}_{\text{LoRA}}(W_{\text{in}}\,x)\big]$ to match the original Helium-7B last hidden state via mean squared error. This provides a dense signal at every position and replaces the implicit supervision that text cross-entropy alone cannot supply.
+    \item \textbf{Mask padded positions in the loss.} Set \texttt{ignore\_index} to the pad-token id; alternatively, switch to a true \texttt{<pad>} token rather than aliasing \texttt{<unk>}.
+    \item \textbf{Unfreeze the depth decoder.} Either fine-tune the depth decoder fully, or, more memory-efficiently, attach LoRA adapters to its attention and MLP layers. Only this allows the depth decoder to learn to read the new backbone's output distribution.
+    \item \textbf{Use a larger student.} A $14\times$ capacity collapse is too severe. Qwen2.5-1.5B or 3B with QLoRA would still fit on a paid-tier A100 or even on the T4 with more aggressive offloading, and would have the representational capacity to retain meaningful behaviour.
+    \item \textbf{Scale data and steps.} The full DailyTalk corpus ($\sim 2{,}500$ dialogues), augmented by other public dialogue datasets, with $50{,}000$ training steps, is a more realistic minimum.
+    \item \textbf{Begin with a scoped-down task.} A worthwhile interim milestone is to demonstrate that the alternative LLM, given the parent's pre-summed embedding, can predict the next \emph{text token} of the Moshi-side response with non-trivial accuracy. This isolates the language-modelling component from the speech-generation component and is a much easier target to hit on free-tier hardware.
+\end{enumerate}
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We set out to test whether Helium-7B inside Moshi could be replaced by Qwen2.5-0.5B with LoRA, on a single free-tier Tesla T4 GPU. The engineering harness --- 4-bit quantization, gradient checkpointing, 8-bit Adam, hybrid backbone with bidirectional projectors, resumable training, and patched Mimi padding logic --- works as designed and stays comfortably within the available VRAM. The training does not: validation loss diverges, audio-codebook accuracy is zero throughout, and end-to-end speech-to-speech generation produces noise.
+
+We have traced this outcome to three concrete structural causes: an unmasked padding-token loss, an input projector that randomly scrambles the parent class's pre-summed embedding (defeating the architectural rationale that motivated the design), and a frozen depth decoder receiving out-of-distribution conditioning vectors that no amount of LoRA-only training inside the alternative LLM can correct. None of these causes are unique to our specific choice of $0.5$-billion-parameter student; we expect the same failure modes to manifest, with somewhat smaller magnitude, for any small-LLM replacement attempted under a similar recipe.
+
+The takeaway is that backbone replacement inside tightly-coupled multimodal foundation models is not a routine application of QLoRA. Effective replacement requires aligning the new backbone's output representation with downstream frozen modules, which in turn requires either dense distillation supervision or partial unfreezing of those modules. We hope the diagnostic value of this negative result, together with our patches to the Moshi reference implementation and the reusable training harness, will be useful to subsequent work pursuing the same goal under more favourable conditions.
+
+\section*{Acknowledgments}
+
+The authors thank the Kyutai team for releasing the Moshi model weights and source code, the Hugging Face team for the Transformers integration, and the maintainers of the \texttt{bitsandbytes} and \texttt{peft} libraries.
+
+\begin{thebibliography}{20}
+
+\bibitem{moshi2024}
+A.~D\'efossez, L.~Mazar\'e, M.~Orsini, A.~Royer, P.~P\'erez, H.~J\'egou, E.~Grave, and N.~Zeghidour, ``Moshi: a speech-text foundation model for real-time dialogue,'' \emph{arXiv preprint arXiv:2410.00037}, 2024.
+
+\bibitem{audiolm2023}
+Z.~Borsos, R.~Marinier, D.~Vincent, E.~Kharitonov, O.~Pietquin, M.~Sharifi, D.~Roblek, O.~Teboul, D.~Grangier, M.~Tagliasacchi, and N.~Zeghidour, ``AudioLM: a Language Modeling Approach to Audio Generation,'' \emph{IEEE/ACM Trans. Audio, Speech, Lang. Process.}, vol.~31, pp.~2523--2533, 2023.
+
+\bibitem{speechgpt2023}
+D.~Zhang, S.~Li, X.~Zhang, J.~Zhan, P.~Wang, Y.~Zhou, and X.~Qiu, ``SpeechGPT: Empowering Large Language Models with Intrinsic Cross-Modal Conversational Abilities,'' in \emph{Findings of EMNLP}, 2023.
+
+\bibitem{lora2021}
+E.~J. Hu, Y.~Shen, P.~Wallis, Z.~Allen-Zhu, Y.~Li, S.~Wang, L.~Wang, and W.~Chen, ``LoRA: Low-Rank Adaptation of Large Language Models,'' in \emph{Proc. ICLR}, 2022.
+
+\bibitem{qlora2023}
+T.~Dettmers, A.~Pagnoni, A.~Holtzman, and L.~Zettlemoyer, ``QLoRA: Efficient Finetuning of Quantized LLMs,'' in \emph{Proc. NeurIPS}, 2023.
+
+\bibitem{bitsandbytes2022}
+T.~Dettmers, M.~Lewis, Y.~Belkada, and L.~Zettlemoyer, ``LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale,'' in \emph{Proc. NeurIPS}, 2022.
+
+\bibitem{kd2015}
+G.~Hinton, O.~Vinyals, and J.~Dean, ``Distilling the Knowledge in a Neural Network,'' \emph{arXiv preprint arXiv:1503.02531}, 2015.
+
+\bibitem{whisper2023}
+A.~Radford, J.~W. Kim, T.~Xu, G.~Brockman, C.~McLeavey, and I.~Sutskever, ``Robust Speech Recognition via Large-Scale Weak Supervision,'' in \emph{Proc. ICML}, 2023.
+
+\bibitem{qwen25}
+Qwen Team, ``Qwen2.5 Technical Report,'' \emph{arXiv preprint arXiv:2412.15115}, 2024.
+
+\bibitem{transformers2020}
+T.~Wolf et al., ``Transformers: State-of-the-Art Natural Language Processing,'' in \emph{Proc. EMNLP: System Demonstrations}, pp.~38--45, 2020.
+
+\bibitem{adamw}
+I.~Loshchilov and F.~Hutter, ``Decoupled Weight Decay Regularization,'' in \emph{Proc. ICLR}, 2019.
+
+\bibitem{bleu2002}
+K.~Papineni, S.~Roukos, T.~Ward, and W.-J. Zhu, ``BLEU: a Method for Automatic Evaluation of Machine Translation,'' in \emph{Proc. ACL}, 2002, pp.~311--318.
+
+\bibitem{dailytalk2023}
+K.~Lee, K.~Park, and D.~Kim, ``DailyTalk: Spoken Dialogue Dataset for Conversational Text-to-Speech,'' in \emph{Proc. ICASSP}, 2023.
+
+\bibitem{colab2023}
+Google, ``Colaboratory: Frequently Asked Questions,'' \url{https://research.google.com/colaboratory/faq.html}, accessed 2026.
+
+\bibitem{peft2023}
+S.~Mangrulkar, S.~Gugger, L.~Debut, Y.~Belkada, S.~Paul, and B.~Bossan, ``PEFT: State-of-the-art Parameter-Efficient Fine-Tuning methods,'' \url{https://github.com/huggingface/peft}, 2022.
+
+\bibitem{accelerate2022}
+S.~Gugger, L.~Debut, T.~Wolf, P.~Schmid, Z.~Mueller, S.~Mangrulkar, M.~Sun, and B.~Bossan, ``Accelerate: Training and inference at scale made simple, efficient and adaptable,'' \url{https://github.com/huggingface/accelerate}, 2022.
+
+\bibitem{adafactor2018}
+N.~Shazeer and M.~Stern, ``Adafactor: Adaptive Learning Rates with Sublinear Memory Cost,'' in \emph{Proc. ICML}, 2018.
+
+\bibitem{soundstream2021}
+N.~Zeghidour, A.~Luebs, A.~Omran, J.~Skoglund, and M.~Tagliasacchi, ``SoundStream: An End-to-End Neural Audio Codec,'' \emph{IEEE/ACM Trans. Audio, Speech, Lang. Process.}, vol.~30, pp.~495--507, 2022.
+
+\bibitem{encodec2023}
+A.~D\'efossez, J.~Copet, G.~Synnaeve, and Y.~Adi, ``High Fidelity Neural Audio Compression,'' \emph{Trans. Mach. Learn. Res.}, 2023.
+
+\bibitem{gradient_checkpointing}
+T.~Chen, B.~Xu, C.~Zhang, and C.~Guestrin, ``Training Deep Nets with Sublinear Memory Cost,'' \emph{arXiv preprint arXiv:1604.06174}, 2016.
+
+\end{thebibliography}
+
+\end{document}
